@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -672,7 +673,8 @@ fn slackMessageForExistingPr(allocator: std.mem.Allocator, identifier: []const u
 }
 
 fn copyToClipboard(allocator: std.mem.Allocator, text: []const u8) !void {
-    var child = std.process.Child.init(&.{"wl-copy"}, allocator);
+    const argv = if (builtin.os.tag == .macos) [_][]const u8{"pbcopy"} else [_][]const u8{"wl-copy"};
+    var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
