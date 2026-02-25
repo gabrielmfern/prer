@@ -51,7 +51,17 @@ pub fn main() !void {
     });
     defer allocator.free(collaborators_output);
 
-    var reviewers = try parseReviewers(allocator, collaborators_output);
+    const self_login_output = try runCommandCapture(allocator, &.{
+        "gh",
+        "api",
+        "user",
+        "--jq",
+        ".login",
+    });
+    defer allocator.free(self_login_output);
+    const self_login = std.mem.trim(u8, self_login_output, " \t\r\n");
+
+    var reviewers = try parseReviewers(allocator, collaborators_output, self_login);
     defer freeReviewerList(allocator, &reviewers);
 
     if (reviewers.items.len == 0) {
@@ -173,7 +183,6 @@ fn editBodyInNvim(allocator: std.mem.Allocator) ![]u8 {
 
 fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     const result = try runCommand(allocator, argv);
-    errdefer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
     switch (result.term) {
@@ -185,8 +194,8 @@ fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]
         else => {},
     }
 
-    std.debug.print("Command failed: {s}\n{s}\n", .{ argv[0], result.stderr });
     allocator.free(result.stdout);
+    std.debug.print("Command failed: {s}\n{s}\n", .{ argv[0], result.stderr });
     return error.CommandFailed;
 }
 
@@ -390,7 +399,11 @@ fn findOpenPrUrlForBranch(allocator: std.mem.Allocator, branch: []const u8) !?[]
     return owned_url;
 }
 
-fn parseReviewers(allocator: std.mem.Allocator, raw_output: []const u8) !std.ArrayList([]const u8) {
+fn parseReviewers(
+    allocator: std.mem.Allocator,
+    raw_output: []const u8,
+    self_login: []const u8,
+) !std.ArrayList([]const u8) {
     var reviewers: std.ArrayList([]const u8) = .empty;
     errdefer freeReviewerList(allocator, &reviewers);
 
@@ -398,6 +411,7 @@ fn parseReviewers(allocator: std.mem.Allocator, raw_output: []const u8) !std.Arr
     while (it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (trimmed.len == 0) continue;
+        if (self_login.len > 0 and std.mem.eql(u8, trimmed, self_login)) continue;
         try reviewers.append(allocator, try allocator.dupe(u8, trimmed));
     }
 
