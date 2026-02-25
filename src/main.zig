@@ -76,6 +76,18 @@ pub fn main() !void {
     const reviewer = try chooseReviewer(allocator, reviewers.items);
     defer allocator.free(reviewer);
 
+    const current_branch_output = try runCommandCapture(allocator, &.{
+        "git",
+        "rev-parse",
+        "--abbrev-ref",
+        "HEAD",
+    });
+    defer allocator.free(current_branch_output);
+    const current_branch = std.mem.trim(u8, current_branch_output, " \t\r\n");
+    if (current_branch.len == 0) {
+        return error.CurrentBranchUnknown;
+    }
+
     const pr_create_output = try runCommandCapture(allocator, &.{
         "gh",
         "pr",
@@ -86,6 +98,8 @@ pub fn main() !void {
         body,
         "--reviewer",
         reviewer,
+        "--head",
+        current_branch,
     });
     defer allocator.free(pr_create_output);
 
