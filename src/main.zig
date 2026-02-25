@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const trim_chars = " \t\r\n";
+const max_command_output_bytes = 1024 * 1024;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -18,7 +20,7 @@ pub fn main() !void {
     std.debug.print("Title: ", .{});
     const raw_title = try readLineAlloc(allocator, 1024);
     defer allocator.free(raw_title);
-    const title = std.mem.trim(u8, raw_title, " \t\r\n");
+    const title = std.mem.trim(u8, raw_title, trim_chars);
     if (title.len == 0) {
         std.debug.print("Title cannot be empty.\n", .{});
         return error.EmptyTitle;
@@ -37,7 +39,7 @@ pub fn main() !void {
         ".nameWithOwner",
     });
     defer allocator.free(repo_name_with_owner);
-    const repo_name = std.mem.trim(u8, repo_name_with_owner, " \t\r\n");
+    const repo_name = std.mem.trim(u8, repo_name_with_owner, trim_chars);
     if (repo_name.len == 0) {
         std.debug.print("Unable to determine repository with `gh repo view`.\n", .{});
         return error.RepositoryNotFound;
@@ -67,23 +69,14 @@ pub fn main() !void {
         ".login",
     });
     defer allocator.free(self_login_output);
-    const self_login = std.mem.trim(u8, self_login_output, " \t\r\n");
+    const self_login = std.mem.trim(u8, self_login_output, trim_chars);
 
     var reviewers = try parseReviewers(allocator, collaborators_output, self_login);
     defer freeReviewerList(allocator, &reviewers);
 
-    const home_dir = try std.process.getEnvVarOwned(allocator, "HOME");
-    defer allocator.free(home_dir);
-
-    const dot_config_dir = try std.fmt.allocPrint(allocator, "{s}/.config", .{home_dir});
-    defer allocator.free(dot_config_dir);
-    const prer_config_dir = try std.fmt.allocPrint(allocator, "{s}/prer", .{dot_config_dir});
-    defer allocator.free(prer_config_dir);
-    const reviewers_map_path = try std.fmt.allocPrint(allocator, "{s}/reviewers.json", .{prer_config_dir});
+    try ensureReviewerConfigDirExists(allocator);
+    const reviewers_map_path = try getReviewersMapPath(allocator);
     defer allocator.free(reviewers_map_path);
-
-    try ensureDirExists(dot_config_dir);
-    try ensureDirExists(prer_config_dir);
     if (reviewers.items.len > 0) {
         try ensureReviewerMapFileExists(allocator, reviewers_map_path, reviewers.items);
     }
@@ -158,7 +151,7 @@ fn editBodyInNvim(allocator: std.mem.Allocator) ![]u8 {
     const body_full = try temp_file.readToEndAlloc(allocator, 1024 * 1024);
     defer allocator.free(body_full);
 
-    const body_trimmed = std.mem.trim(u8, body_full, " \t\r\n");
+    const body_trimmed = std.mem.trim(u8, body_full, trim_chars);
     return allocator.dupe(u8, body_trimmed);
 }
 
@@ -184,7 +177,7 @@ fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !std.proce
     return std.process.Child.run(.{
         .allocator = allocator,
         .argv = argv,
-        .max_output_bytes = 1024 * 1024,
+        .max_output_bytes = max_command_output_bytes,
     });
 }
 
@@ -195,7 +188,7 @@ fn runGhPrCreate(
     reviewer: ?[]const u8,
     current_branch: []const u8,
 ) ![]u8 {
-    var argv = try std.ArrayList([]const u8).initCapacity(allocator, 12);
+    var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{ "gh", "pr", "create", "--title", title, "--body", body });
     if (reviewer) |r| try argv.appendSlice(allocator, &.{ "--reviewer", r });
@@ -208,7 +201,7 @@ fn runGhPrCreate(
     try child.spawn();
 
     const stdout = child.stdout orelse return error.NoStdout;
-    const raw = try stdout.readToEndAlloc(allocator, 1024 * 1024);
+    const raw = try stdout.readToEndAlloc(allocator, max_command_output_bytes);
     defer allocator.free(raw);
 
     const term = try child.wait();
@@ -247,7 +240,7 @@ fn runPreflightChecks(allocator: std.mem.Allocator) !void {
         defer allocator.free(remote_result.stderr);
 
         const has_origin = switch (remote_result.term) {
-            .Exited => |code| code == 0 and std.mem.trim(u8, remote_result.stdout, " \t\r\n").len > 0,
+            .Exited => |code| code == 0 and std.mem.trim(u8, remote_result.stdout, trim_chars).len > 0,
             else => false,
         };
 
@@ -278,7 +271,7 @@ fn runPreflightChecks(allocator: std.mem.Allocator) !void {
         defer allocator.free(status_result.stderr);
 
         if (status_result.term == .Exited and status_result.term.Exited == 0) {
-            const has_uncommitted = std.mem.trim(u8, status_result.stdout, " \t\r\n").len > 0;
+            const has_uncommitted = std.mem.trim(u8, status_result.stdout, trim_chars).len > 0;
             if (has_uncommitted) {
                 needs_attention = true;
                 std.debug.print(
@@ -329,7 +322,7 @@ fn runPreflightChecks(allocator: std.mem.Allocator) !void {
         ".defaultBranchRef.name",
     });
     defer allocator.free(base_branch_output);
-    const base_branch = std.mem.trim(u8, base_branch_output, " \t\r\n");
+    const base_branch = std.mem.trim(u8, base_branch_output, trim_chars);
     if (base_branch.len == 0) return error.TargetBranchUnknown;
 
     const base_ref = try std.fmt.allocPrint(allocator, "origin/{s}", .{base_branch});
@@ -377,7 +370,7 @@ fn runPreflightChecks(allocator: std.mem.Allocator) !void {
 fn commitCount(allocator: std.mem.Allocator, argv: []const []const u8) !usize {
     const count_text = try runCommandCapture(allocator, argv);
     defer allocator.free(count_text);
-    const trimmed = std.mem.trim(u8, count_text, " \t\r\n");
+    const trimmed = std.mem.trim(u8, count_text, trim_chars);
     return std.fmt.parseUnsigned(usize, trimmed, 10);
 }
 
@@ -385,7 +378,7 @@ fn confirmYesNo(allocator: std.mem.Allocator, prompt: []const u8) !bool {
     std.debug.print("{s}", .{prompt});
     const answer_raw = try readLineAlloc(allocator, 16);
     defer allocator.free(answer_raw);
-    const answer = std.mem.trim(u8, answer_raw, " \t\r\n");
+    const answer = std.mem.trim(u8, answer_raw, trim_chars);
     if (answer.len == 0) return false;
     return std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes");
 }
@@ -399,7 +392,7 @@ fn getCurrentBranch(allocator: std.mem.Allocator) ![]u8 {
     });
     defer allocator.free(current_branch_output);
 
-    const current_branch = std.mem.trim(u8, current_branch_output, " \t\r\n");
+    const current_branch = std.mem.trim(u8, current_branch_output, trim_chars);
     if (current_branch.len == 0) return error.CurrentBranchUnknown;
     return allocator.dupe(u8, current_branch);
 }
@@ -422,7 +415,7 @@ fn findOpenPrUrlForBranch(allocator: std.mem.Allocator, branch: []const u8) !?[]
     });
     defer allocator.free(pr_url_output);
 
-    const pr_url = std.mem.trim(u8, pr_url_output, " \t\r\n");
+    const pr_url = std.mem.trim(u8, pr_url_output, trim_chars);
     if (pr_url.len == 0 or std.mem.eql(u8, pr_url, "null")) {
         return null;
     }
@@ -441,7 +434,7 @@ fn parseReviewers(
 
     var it = std.mem.splitScalar(u8, raw_output, '\n');
     while (it.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        const trimmed = std.mem.trim(u8, line, trim_chars);
         if (trimmed.len == 0) continue;
         if (self_login.len > 0 and std.mem.eql(u8, trimmed, self_login)) continue;
         try reviewers.append(allocator, try allocator.dupe(u8, trimmed));
@@ -462,6 +455,23 @@ fn ensureDirExists(path: []const u8) !void {
         error.PathAlreadyExists => {},
         else => return err,
     };
+}
+
+fn getReviewersMapPath(allocator: std.mem.Allocator) ![]u8 {
+    const home_dir = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home_dir);
+    return std.fmt.allocPrint(allocator, "{s}/.config/prer/reviewers.json", .{home_dir});
+}
+
+fn ensureReviewerConfigDirExists(allocator: std.mem.Allocator) !void {
+    const home_dir = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home_dir);
+    const dot_config_dir = try std.fmt.allocPrint(allocator, "{s}/.config", .{home_dir});
+    defer allocator.free(dot_config_dir);
+    const prer_config_dir = try std.fmt.allocPrint(allocator, "{s}/prer", .{dot_config_dir});
+    defer allocator.free(prer_config_dir);
+    try ensureDirExists(dot_config_dir);
+    try ensureDirExists(prer_config_dir);
 }
 
 fn ensureReviewerMapFileExists(
@@ -532,7 +542,7 @@ fn loadSlackHandle(
     };
     defer file.close();
 
-    const raw_json = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const raw_json = try file.readToEndAlloc(allocator, max_command_output_bytes);
     defer allocator.free(raw_json);
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{
@@ -548,7 +558,7 @@ fn loadSlackHandle(
 
     if (parsed.value.object.get(reviewer)) |value| {
         if (value == .string) {
-            const trimmed = std.mem.trim(u8, value.string, " \t\r\n");
+            const trimmed = std.mem.trim(u8, value.string, trim_chars);
             const handle = trimLeadingAt(trimmed);
             if (handle.len != 0) {
                 return allocator.dupe(u8, handle);
@@ -592,7 +602,7 @@ fn trimLeadingAt(s: []const u8) []const u8 {
 }
 
 fn isPrIdentifier(s: []const u8) bool {
-    const trimmed = std.mem.trim(u8, s, " \t\r\n");
+    const trimmed = std.mem.trim(u8, s, trim_chars);
     if (trimmed.len == 0) return false;
     if (std.mem.startsWith(u8, trimmed, "https://") and std.mem.indexOf(u8, trimmed, "/pull/") != null) {
         return true;
@@ -660,9 +670,7 @@ fn slackMessageForExistingPr(allocator: std.mem.Allocator, identifier: []const u
         }
     }
 
-    const home_dir = try std.process.getEnvVarOwned(allocator, "HOME");
-    defer allocator.free(home_dir);
-    const reviewers_map_path = try std.fmt.allocPrint(allocator, "{s}/.config/prer/reviewers.json", .{home_dir});
+    const reviewers_map_path = try getReviewersMapPath(allocator);
     defer allocator.free(reviewers_map_path);
 
     const slack_message = try buildSlackPrMessage(allocator, reviewers_map_path, reviewer_login, title, pr_url);
@@ -693,4 +701,136 @@ fn copyToClipboard(allocator: std.mem.Allocator, text: []const u8) !void {
         },
         else => return error.ClipboardCopyFailed,
     }
+}
+
+test "isPrIdentifier parses number and URL" {
+    try std.testing.expect(isPrIdentifier("123"));
+    try std.testing.expect(isPrIdentifier("https://github.com/foo/bar/pull/9"));
+    try std.testing.expect(!isPrIdentifier("abc"));
+    try std.testing.expect(!isPrIdentifier("https://github.com/foo/bar/issues/9"));
+}
+
+test "extractPrUrlFromOutput returns last PR URL" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\Creating pull request for feat/x into main in foo/bar
+        \\
+        \\https://github.com/foo/bar/pull/1
+        \\https://github.com/foo/bar/pull/2
+    ;
+    const url_opt = try extractPrUrlFromOutput(allocator, raw);
+    defer if (url_opt) |url| allocator.free(url);
+    try std.testing.expect(url_opt != null);
+    try std.testing.expectEqualStrings("https://github.com/foo/bar/pull/2", url_opt.?);
+}
+
+test "buildSlackPrMessage without reviewer" {
+    const allocator = std.testing.allocator;
+    const msg = try buildSlackPrMessage(
+        allocator,
+        "/definitely/does/not/exist/reviewers.json",
+        null,
+        "Title",
+        "https://github.com/foo/bar/pull/1",
+    );
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings(
+        "[:open-pr: Title](https://github.com/foo/bar/pull/1)",
+        msg,
+    );
+}
+
+test "integration: run actual CLI for existing PR URL" {
+    const allocator = std.testing.allocator;
+
+    if (!try commandExists(allocator, "zig")) return error.SkipZigTest;
+    if (!try commandExists(allocator, "gh")) return error.SkipZigTest;
+    if (builtin.os.tag == .linux and !try commandExists(allocator, "wl-copy")) return error.SkipZigTest;
+    if (builtin.os.tag == .macos and !try commandExists(allocator, "pbcopy")) return error.SkipZigTest;
+
+    // Requires real gh authentication and at least one open PR in current repo.
+    if (!try ghAuthReady(allocator)) return error.SkipZigTest;
+    const open_pr_url = try getFirstOpenPrUrlForCurrentRepo(allocator);
+    defer if (open_pr_url) |url| allocator.free(url);
+    if (open_pr_url == null) return error.SkipZigTest;
+
+    const build_result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "zig", "build" },
+        .cwd = ".",
+        .max_output_bytes = max_command_output_bytes,
+    });
+    defer allocator.free(build_result.stdout);
+    defer allocator.free(build_result.stderr);
+    if (build_result.term != .Exited or build_result.term.Exited != 0) {
+        std.debug.print("zig build failed in integration test:\n{s}\n", .{build_result.stderr});
+        return error.TestExpectedEqual;
+    }
+
+    const run_result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "zig-out/bin/prer", open_pr_url.? },
+        .cwd = ".",
+        .max_output_bytes = max_command_output_bytes,
+    });
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
+
+    if (run_result.term != .Exited or run_result.term.Exited != 0) {
+        std.debug.print("CLI integration run failed:\n{s}\n", .{run_result.stderr});
+        return error.TestExpectedEqual;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, run_result.stderr, "Copied to clipboard:") != null);
+}
+
+fn commandExists(allocator: std.mem.Allocator, command: []const u8) !bool {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "which", command },
+        .max_output_bytes = 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return result.term == .Exited and result.term.Exited == 0;
+}
+
+fn ghAuthReady(allocator: std.mem.Allocator) !bool {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "gh", "auth", "status" },
+        .max_output_bytes = 4096,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return result.term == .Exited and result.term.Exited == 0;
+}
+
+fn getFirstOpenPrUrlForCurrentRepo(allocator: std.mem.Allocator) !?[]u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            "gh",
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--json",
+            "url",
+            "--limit",
+            "1",
+            "--jq",
+            ".[0].url",
+        },
+        .max_output_bytes = 4096,
+    });
+    defer allocator.free(result.stderr);
+    if (result.term != .Exited or result.term.Exited != 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+    defer allocator.free(result.stdout);
+    const trimmed = std.mem.trim(u8, result.stdout, trim_chars);
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "null")) return null;
+    const owned_url = try allocator.dupe(u8, trimmed);
+    return owned_url;
 }
