@@ -311,7 +311,7 @@ fn runPreflightChecks(allocator: std.mem.Allocator) !void {
     if (needs_attention) {
         const proceed = try confirmYesNo(
             allocator,
-            "Preflight found issues. Continue creating PR anyway? [y/N]: ",
+            "Continue creating PR anyway? [y/N]: ",
         );
         if (!proceed) {
             return error.AbortedByUser;
