@@ -89,13 +89,7 @@ pub fn main() !void {
     const current_branch = try getCurrentBranch(allocator);
     defer allocator.free(current_branch);
 
-    try runGhPrCreate(allocator, title, body, reviewer, current_branch);
-
-    const pr_url_opt = try findOpenPrUrlForBranch(allocator, current_branch);
-    const pr_url = pr_url_opt orelse {
-        std.debug.print("PR was created but could not get its URL.\n", .{});
-        return error.MissingPrUrl;
-    };
+    const pr_url = try runGhPrCreate(allocator, title, body, reviewer, current_branch);
     defer allocator.free(pr_url);
 
     const slack_message = if (reviewer) |r| blk: {
@@ -204,7 +198,7 @@ fn runGhPrCreate(
     body: []const u8,
     reviewer: ?[]const u8,
     current_branch: []const u8,
-) !void {
+) ![]u8 {
     var argv = try std.ArrayList([]const u8).initCapacity(allocator, 12);
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{ "gh", "pr", "create", "--title", title, "--body", body });
@@ -213,9 +207,14 @@ fn runGhPrCreate(
 
     var child = std.process.Child.init(argv.items, allocator);
     child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Inherit;
+    child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Inherit;
     try child.spawn();
+
+    const stdout = child.stdout orelse return error.NoStdout;
+    const raw = try stdout.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(raw);
+
     const term = try child.wait();
     switch (term) {
         .Exited => |code| {
@@ -223,6 +222,25 @@ fn runGhPrCreate(
         },
         else => return error.CommandFailed,
     }
+
+    const url = (try extractPrUrlFromOutput(allocator, raw)) orelse {
+        std.debug.print("`gh pr create` did not return a URL.\n", .{});
+        return error.MissingPrUrl;
+    };
+    return url;
+}
+
+fn extractPrUrlFromOutput(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
+    var last_url: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (std.mem.startsWith(u8, trimmed, "https://") and std.mem.indexOf(u8, trimmed, "/pull/") != null) {
+            last_url = trimmed;
+        }
+    }
+    return if (last_url) |u| try allocator.dupe(u8, u) else null;
 }
 
 fn runPreflightChecks(allocator: std.mem.Allocator) !void {
@@ -557,7 +575,7 @@ fn copyToClipboard(allocator: std.mem.Allocator, text: []const u8) !void {
     var child = std.process.Child.init(&.{"wl-copy"}, allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
 
     try child.spawn();
 
@@ -566,24 +584,10 @@ fn copyToClipboard(allocator: std.mem.Allocator, text: []const u8) !void {
     stdin_file.close();
     child.stdin = null;
 
-    var stderr_buffer: std.ArrayList(u8) = .empty;
-    defer stderr_buffer.deinit(allocator);
-
-    if (child.stderr) |stderr_file| {
-        const err_text = try stderr_file.readToEndAlloc(allocator, 64 * 1024);
-        defer allocator.free(err_text);
-        if (err_text.len > 0) {
-            try stderr_buffer.appendSlice(allocator, err_text);
-        }
-    }
-
     const term = try child.wait();
     switch (term) {
         .Exited => |code| {
-            if (code != 0) {
-                std.debug.print("wl-copy failed:\n{s}\n", .{stderr_buffer.items});
-                return error.ClipboardCopyFailed;
-            }
+            if (code != 0) return error.ClipboardCopyFailed;
         },
         else => return error.ClipboardCopyFailed,
     }
