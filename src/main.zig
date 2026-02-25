@@ -197,8 +197,6 @@ fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !std.proce
 }
 
 fn runPreflightChecks(allocator: std.mem.Allocator) !void {
-    std.debug.print("Running preflight checks...\n", .{});
-
     // Ensure the branch has an origin remote.
     {
         const remote_result = try runCommand(allocator, &.{ "git", "remote", "get-url", "origin" });
