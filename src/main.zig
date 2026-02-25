@@ -64,11 +64,6 @@ pub fn main() !void {
     var reviewers = try parseReviewers(allocator, collaborators_output, self_login);
     defer freeReviewerList(allocator, &reviewers);
 
-    if (reviewers.items.len == 0) {
-        std.debug.print("No collaborators available to review this PR.\n", .{});
-        return error.NoReviewersAvailable;
-    }
-
     const home_dir = try std.process.getEnvVarOwned(allocator, "HOME");
     defer allocator.free(home_dir);
 
@@ -81,44 +76,40 @@ pub fn main() !void {
 
     try ensureDirExists(dot_config_dir);
     try ensureDirExists(prer_config_dir);
-    try ensureReviewerMapFileExists(allocator, reviewers_map_path, reviewers.items);
+    if (reviewers.items.len > 0) {
+        try ensureReviewerMapFileExists(allocator, reviewers_map_path, reviewers.items);
+    }
 
-    const reviewer = try chooseReviewer(allocator, reviewers.items);
-    defer allocator.free(reviewer);
+    const reviewer: ?[]const u8 = if (reviewers.items.len > 0)
+        try chooseReviewer(allocator, reviewers.items)
+    else
+        null;
+    defer if (reviewer) |r| allocator.free(r);
 
     const current_branch = try getCurrentBranch(allocator);
     defer allocator.free(current_branch);
 
-    std.debug.print("Creating pull request...\n", .{});
+    try runGhPrCreate(allocator, title, body, reviewer, current_branch);
 
-    const pr_create_output = try runCommandCapture(allocator, &.{
-        "gh",
-        "pr",
-        "create",
-        "--title",
-        title,
-        "--body",
-        body,
-        "--reviewer",
-        reviewer,
-        "--head",
-        current_branch,
-    });
-    defer allocator.free(pr_create_output);
-
-    const pr_url = std.mem.trim(u8, pr_create_output, " \t\r\n");
-    if (pr_url.len == 0) {
-        std.debug.print("`gh pr create` did not return a URL.\n", .{});
+    const pr_url_opt = try findOpenPrUrlForBranch(allocator, current_branch);
+    const pr_url = pr_url_opt orelse {
+        std.debug.print("PR was created but could not get its URL.\n", .{});
         return error.MissingPrUrl;
-    }
+    };
+    defer allocator.free(pr_url);
 
-    const slack_handle = try loadSlackHandle(allocator, reviewers_map_path, reviewer);
-    defer allocator.free(slack_handle);
-
-    const slack_message = try std.fmt.allocPrint(
+    const slack_message = if (reviewer) |r| blk: {
+        const slack_handle = try loadSlackHandle(allocator, reviewers_map_path, r);
+        defer allocator.free(slack_handle);
+        break :blk try std.fmt.allocPrint(
+            allocator,
+            "[:open-pr: {s} @{s}]({s})",
+            .{ title, slack_handle, pr_url },
+        );
+    } else try std.fmt.allocPrint(
         allocator,
-        "[:open-pr: {s} @{s}]({s})",
-        .{ title, slack_handle, pr_url },
+        "[:open-pr: {s}]({s})",
+        .{ title, pr_url },
     );
     defer allocator.free(slack_message);
 
@@ -205,6 +196,33 @@ fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !std.proce
         .argv = argv,
         .max_output_bytes = 1024 * 1024,
     });
+}
+
+fn runGhPrCreate(
+    allocator: std.mem.Allocator,
+    title: []const u8,
+    body: []const u8,
+    reviewer: ?[]const u8,
+    current_branch: []const u8,
+) !void {
+    var argv = try std.ArrayList([]const u8).initCapacity(allocator, 12);
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ "gh", "pr", "create", "--title", title, "--body", body });
+    if (reviewer) |r| try argv.appendSlice(allocator, &.{ "--reviewer", r });
+    try argv.appendSlice(allocator, &.{ "--head", current_branch });
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) return error.CommandFailed;
+        },
+        else => return error.CommandFailed,
+    }
 }
 
 fn runPreflightChecks(allocator: std.mem.Allocator) !void {
