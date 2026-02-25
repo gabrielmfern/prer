@@ -5,6 +5,13 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    if (args.len >= 2 and isPrIdentifier(args[1])) {
+        return slackMessageForExistingPr(allocator, args[1]);
+    }
+
     try runPreflightChecks(allocator);
 
     std.debug.print("Title: ", .{});
@@ -92,19 +99,7 @@ pub fn main() !void {
     const pr_url = try runGhPrCreate(allocator, title, body, reviewer, current_branch);
     defer allocator.free(pr_url);
 
-    const slack_message = if (reviewer) |r| blk: {
-        const slack_handle = try loadSlackHandle(allocator, reviewers_map_path, r);
-        defer allocator.free(slack_handle);
-        break :blk try std.fmt.allocPrint(
-            allocator,
-            "[:open-pr: {s} @{s}]({s})",
-            .{ title, slack_handle, pr_url },
-        );
-    } else try std.fmt.allocPrint(
-        allocator,
-        "[:open-pr: {s}]({s})",
-        .{ title, pr_url },
-    );
+    const slack_message = try buildSlackPrMessage(allocator, reviewers_map_path, reviewer, title, pr_url);
     defer allocator.free(slack_message);
 
     try copyToClipboard(allocator, slack_message);
@@ -563,12 +558,117 @@ fn loadSlackHandle(
     return allocator.dupe(u8, reviewer);
 }
 
+/// Builds the Slack-formatted PR message. Caller owns the returned string.
+fn buildSlackPrMessage(
+    allocator: std.mem.Allocator,
+    reviewers_map_path: []const u8,
+    reviewer_github_handle: ?[]const u8,
+    title: []const u8,
+    pr_url: []const u8,
+) ![]u8 {
+    if (reviewer_github_handle) |login| {
+        const slack_handle = try loadSlackHandle(allocator, reviewers_map_path, login);
+        defer allocator.free(slack_handle);
+        return std.fmt.allocPrint(
+            allocator,
+            "[:open-pr: {s} @{s}]({s})",
+            .{ title, slack_handle, pr_url },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "[:open-pr: {s}]({s})",
+        .{ title, pr_url },
+    );
+}
+
 fn trimLeadingAt(s: []const u8) []const u8 {
     var start: usize = 0;
     while (start < s.len and s[start] == '@') {
         start += 1;
     }
     return s[start..];
+}
+
+fn isPrIdentifier(s: []const u8) bool {
+    const trimmed = std.mem.trim(u8, s, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (std.mem.startsWith(u8, trimmed, "https://") and std.mem.indexOf(u8, trimmed, "/pull/") != null) {
+        return true;
+    }
+    for (trimmed) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
+fn slackMessageForExistingPr(allocator: std.mem.Allocator, identifier: []const u8) !void {
+    const json_output = runCommandCapture(allocator, &.{
+        "gh",
+        "pr",
+        "view",
+        identifier,
+        "--json",
+        "url,title,reviewRequests",
+    }) catch |err| {
+        std.debug.print("Could not get PR: {s}. Run from a repo or use a valid number/URL.\n", .{@errorName(err)});
+        return err;
+    };
+    defer allocator.free(json_output);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_output, .{
+        .allocate = .alloc_always,
+    }) catch {
+        std.debug.print("Invalid JSON from `gh pr view`.\n", .{});
+        return error.InvalidPrViewOutput;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        std.debug.print("Expected JSON object from `gh pr view`.\n", .{});
+        return error.InvalidPrViewOutput;
+    }
+
+    const url_val = parsed.value.object.get("url") orelse {
+        std.debug.print("PR has no url field.\n", .{});
+        return error.InvalidPrViewOutput;
+    };
+    if (url_val != .string) return error.InvalidPrViewOutput;
+    const pr_url = try allocator.dupe(u8, url_val.string);
+    defer allocator.free(pr_url);
+
+    const title_val = parsed.value.object.get("title") orelse {
+        std.debug.print("PR has no title field.\n", .{});
+        return error.InvalidPrViewOutput;
+    };
+    if (title_val != .string) return error.InvalidPrViewOutput;
+    const title = try allocator.dupe(u8, title_val.string);
+    defer allocator.free(title);
+
+    var reviewer_login: ?[]const u8 = null;
+    if (parsed.value.object.get("reviewRequests")) |rv| {
+        if (rv == .array and rv.array.items.len > 0) {
+            const first = rv.array.items[0];
+            if (first == .object) {
+                if (first.object.get("login")) |login_val| {
+                    if (login_val == .string) {
+                        reviewer_login = login_val.string;
+                    }
+                }
+            }
+        }
+    }
+
+    const home_dir = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home_dir);
+    const reviewers_map_path = try std.fmt.allocPrint(allocator, "{s}/.config/prer/reviewers.json", .{home_dir});
+    defer allocator.free(reviewers_map_path);
+
+    const slack_message = try buildSlackPrMessage(allocator, reviewers_map_path, reviewer_login, title, pr_url);
+    defer allocator.free(slack_message);
+
+    try copyToClipboard(allocator, slack_message);
+    std.debug.print("Copied to clipboard: {s}\n", .{slack_message});
 }
 
 fn copyToClipboard(allocator: std.mem.Allocator, text: []const u8) !void {
