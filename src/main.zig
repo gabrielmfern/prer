@@ -5,6 +5,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    try runPreflightChecks(allocator);
+
     std.debug.print("Title: ", .{});
     const raw_title = try readLineAlloc(allocator, 1024);
     defer allocator.free(raw_title);
@@ -168,11 +170,7 @@ fn editBodyInNvim(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = 1024 * 1024,
-    });
+    const result = try runCommand(allocator, argv);
     errdefer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
@@ -188,6 +186,155 @@ fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]
     std.debug.print("Command failed: {s}\n{s}\n", .{ argv[0], result.stderr });
     allocator.free(result.stdout);
     return error.CommandFailed;
+}
+
+fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !std.process.Child.RunResult {
+    return std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .max_output_bytes = 1024 * 1024,
+    });
+}
+
+fn runPreflightChecks(allocator: std.mem.Allocator) !void {
+    std.debug.print("Running preflight checks...\n", .{});
+
+    // Ensure the branch has an origin remote.
+    {
+        const remote_result = try runCommand(allocator, &.{ "git", "remote", "get-url", "origin" });
+        defer allocator.free(remote_result.stdout);
+        defer allocator.free(remote_result.stderr);
+
+        const has_origin = switch (remote_result.term) {
+            .Exited => |code| code == 0 and std.mem.trim(u8, remote_result.stdout, " \t\r\n").len > 0,
+            else => false,
+        };
+
+        if (!has_origin) {
+            std.debug.print("No `origin` remote found. Configure a remote before creating a PR.\n", .{});
+            return error.MissingOriginRemote;
+        }
+    }
+
+    var needs_attention = false;
+
+    // Check for uncommitted changes.
+    {
+        const status_result = try runCommand(allocator, &.{ "git", "status", "--porcelain" });
+        defer allocator.free(status_result.stdout);
+        defer allocator.free(status_result.stderr);
+
+        if (status_result.term == .Exited and status_result.term.Exited == 0) {
+            const has_uncommitted = std.mem.trim(u8, status_result.stdout, " \t\r\n").len > 0;
+            if (has_uncommitted) {
+                needs_attention = true;
+                std.debug.print(
+                    "Working tree has uncommitted changes. Consider committing or stashing first.\n",
+                    .{},
+                );
+            }
+        }
+    }
+
+    // Check for an upstream and whether local commits are pushed.
+    var has_upstream = false;
+    {
+        const upstream_result = try runCommand(
+            allocator,
+            &.{ "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}" },
+        );
+        defer allocator.free(upstream_result.stdout);
+        defer allocator.free(upstream_result.stderr);
+
+        has_upstream = upstream_result.term == .Exited and upstream_result.term.Exited == 0;
+        if (!has_upstream) {
+            needs_attention = true;
+            std.debug.print(
+                "Current branch has no upstream. Push with `git push -u origin <branch>` before creating a PR.\n",
+                .{},
+            );
+        } else {
+            const ahead_count = try commitCount(allocator, &.{ "git", "rev-list", "--count", "@{upstream}..HEAD" });
+            if (ahead_count > 0) {
+                needs_attention = true;
+                std.debug.print(
+                    "Current branch is ahead of upstream by {d} commit(s). Consider pushing first.\n",
+                    .{ahead_count},
+                );
+            }
+        }
+    }
+
+    // Check commit delta relative to PR target branch (default branch).
+    const base_branch_output = try runCommandCapture(allocator, &.{
+        "gh",
+        "repo",
+        "view",
+        "--json",
+        "defaultBranchRef",
+        "-q",
+        ".defaultBranchRef.name",
+    });
+    defer allocator.free(base_branch_output);
+    const base_branch = std.mem.trim(u8, base_branch_output, " \t\r\n");
+    if (base_branch.len == 0) return error.TargetBranchUnknown;
+
+    const base_ref = try std.fmt.allocPrint(allocator, "origin/{s}", .{base_branch});
+    defer allocator.free(base_ref);
+
+    const base_to_head_range = try std.fmt.allocPrint(allocator, "{s}..HEAD", .{base_ref});
+    defer allocator.free(base_to_head_range);
+    const local_base_to_head_range = try std.fmt.allocPrint(allocator, "{s}..HEAD", .{base_branch});
+    defer allocator.free(local_base_to_head_range);
+
+    const ahead_of_base = commitCount(allocator, &.{ "git", "rev-list", "--count", base_to_head_range }) catch blk: {
+        // Fallback in case origin/<base> is unavailable locally.
+        break :blk try commitCount(allocator, &.{ "git", "rev-list", "--count", local_base_to_head_range });
+    };
+    if (ahead_of_base == 0) {
+        std.debug.print(
+            "No commits between current branch and target `{s}`. Nothing to open in a PR.\n",
+            .{base_branch},
+        );
+        return error.NoCommitsToPullRequest;
+    }
+
+    const head_to_base_range = try std.fmt.allocPrint(allocator, "HEAD..{s}", .{base_ref});
+    defer allocator.free(head_to_base_range);
+    const behind_base = commitCount(allocator, &.{ "git", "rev-list", "--count", head_to_base_range }) catch 0;
+    if (behind_base > 0) {
+        needs_attention = true;
+        std.debug.print(
+            "Target branch `{s}` is ahead by {d} commit(s). Consider rebasing/merging before creating a PR.\n",
+            .{ base_branch, behind_base },
+        );
+    }
+
+    if (needs_attention) {
+        const proceed = try confirmYesNo(
+            allocator,
+            "Preflight found issues. Continue creating PR anyway? [y/N]: ",
+        );
+        if (!proceed) {
+            return error.AbortedByUser;
+        }
+    }
+}
+
+fn commitCount(allocator: std.mem.Allocator, argv: []const []const u8) !usize {
+    const count_text = try runCommandCapture(allocator, argv);
+    defer allocator.free(count_text);
+    const trimmed = std.mem.trim(u8, count_text, " \t\r\n");
+    return std.fmt.parseUnsigned(usize, trimmed, 10);
+}
+
+fn confirmYesNo(allocator: std.mem.Allocator, prompt: []const u8) !bool {
+    std.debug.print("{s}", .{prompt});
+    const answer_raw = try readLineAlloc(allocator, 16);
+    defer allocator.free(answer_raw);
+    const answer = std.mem.trim(u8, answer_raw, " \t\r\n");
+    if (answer.len == 0) return false;
+    return std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes");
 }
 
 fn parseReviewers(allocator: std.mem.Allocator, raw_output: []const u8) !std.ArrayList([]const u8) {
