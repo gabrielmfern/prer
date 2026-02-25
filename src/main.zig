@@ -76,17 +76,10 @@ pub fn main() !void {
     const reviewer = try chooseReviewer(allocator, reviewers.items);
     defer allocator.free(reviewer);
 
-    const current_branch_output = try runCommandCapture(allocator, &.{
-        "git",
-        "rev-parse",
-        "--abbrev-ref",
-        "HEAD",
-    });
-    defer allocator.free(current_branch_output);
-    const current_branch = std.mem.trim(u8, current_branch_output, " \t\r\n");
-    if (current_branch.len == 0) {
-        return error.CurrentBranchUnknown;
-    }
+    const current_branch = try getCurrentBranch(allocator);
+    defer allocator.free(current_branch);
+
+    std.debug.print("Creating pull request...\n", .{});
 
     const pr_create_output = try runCommandCapture(allocator, &.{
         "gh",
@@ -229,6 +222,18 @@ fn runPreflightChecks(allocator: std.mem.Allocator) !void {
     }
 
     var needs_attention = false;
+    const current_branch = try getCurrentBranch(allocator);
+    defer allocator.free(current_branch);
+
+    // Fail fast if an open PR already exists for this branch.
+    if (try findOpenPrUrlForBranch(allocator, current_branch)) |existing_pr_url| {
+        defer allocator.free(existing_pr_url);
+        std.debug.print(
+            "An open PR already exists for branch `{s}`: {s}\n",
+            .{ current_branch, existing_pr_url },
+        );
+        return error.PullRequestAlreadyExists;
+    }
 
     // Check for uncommitted changes.
     {
@@ -347,6 +352,47 @@ fn confirmYesNo(allocator: std.mem.Allocator, prompt: []const u8) !bool {
     const answer = std.mem.trim(u8, answer_raw, " \t\r\n");
     if (answer.len == 0) return false;
     return std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes");
+}
+
+fn getCurrentBranch(allocator: std.mem.Allocator) ![]u8 {
+    const current_branch_output = try runCommandCapture(allocator, &.{
+        "git",
+        "rev-parse",
+        "--abbrev-ref",
+        "HEAD",
+    });
+    defer allocator.free(current_branch_output);
+
+    const current_branch = std.mem.trim(u8, current_branch_output, " \t\r\n");
+    if (current_branch.len == 0) return error.CurrentBranchUnknown;
+    return allocator.dupe(u8, current_branch);
+}
+
+fn findOpenPrUrlForBranch(allocator: std.mem.Allocator, branch: []const u8) !?[]u8 {
+    const pr_url_output = try runCommandCapture(allocator, &.{
+        "gh",
+        "pr",
+        "list",
+        "--head",
+        branch,
+        "--state",
+        "open",
+        "--json",
+        "url",
+        "--limit",
+        "1",
+        "--jq",
+        ".[0].url",
+    });
+    defer allocator.free(pr_url_output);
+
+    const pr_url = std.mem.trim(u8, pr_url_output, " \t\r\n");
+    if (pr_url.len == 0 or std.mem.eql(u8, pr_url, "null")) {
+        return null;
+    }
+
+    const owned_url = try allocator.dupe(u8, pr_url);
+    return owned_url;
 }
 
 fn parseReviewers(allocator: std.mem.Allocator, raw_output: []const u8) !std.ArrayList([]const u8) {
