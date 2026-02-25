@@ -168,11 +168,6 @@ fn editBodyInNvim(allocator: std.mem.Allocator) ![]u8 {
     defer allocator.free(body_full);
 
     const body_trimmed = std.mem.trim(u8, body_full, " \t\r\n");
-    if (body_trimmed.len == 0) {
-        std.debug.print("PR body cannot be empty.\n", .{});
-        return error.EmptyBody;
-    }
-
     return allocator.dupe(u8, body_trimmed);
 }
 
